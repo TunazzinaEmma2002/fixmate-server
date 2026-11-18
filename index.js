@@ -262,6 +262,118 @@ app.delete("/api/services/:id", verifyToken, verifyTechnician, async (req, res) 
   const result = await servicesCol.deleteOne({ _id });
   res.send(result);
 });
+
+// ---------- bookings ----------
+app.post("/api/bookings", verifyToken, verifyCustomer, async (req, res) => {
+  const { serviceId, customerPhone, address, preferredDate, problemDescription } = req.body || {};
+  const _id = toId(serviceId);
+  if (!_id) return res.status(400).send({ message: "Invalid service" });
+  const phone = String(customerPhone || "").trim();
+  const addr = String(address || "").trim();
+  const problem = String(problemDescription || "").trim();
+  if (!/^[0-9+\-\s]{7,20}$/.test(phone)) return res.status(400).send({ message: "Please enter a valid phone number" });
+  if (addr.length < 5) return res.status(400).send({ message: "Please enter your full address" });
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(preferredDate || ""))) {
+    return res.status(400).send({ message: "Please choose a valid date" });
+  }
+  // today or later (one day of slack so every timezone works)
+  const earliest = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  if (preferredDate < earliest) return res.status(400).send({ message: "Preferred date must be today or later" });
+  if (problem.length < 20) {
+    return res.status(400).send({ message: "Please describe the problem in at least 20 characters" });
+  }
+
+  const service = await servicesCol.findOne({ _id, ...publicFilter });
+  if (!service) return res.status(404).send({ message: "This service is not available" });
+  if (service.technicianEmail === req.user.email) {
+    return res.status(400).send({ message: "You cannot request your own service" });
+  }
+  const duplicate = await bookingsCol.findOne({
+    serviceId: String(service._id),
+    customerEmail: req.user.email,
+    status: { $in: ACTIVE },
+  });
+  if (duplicate) {
+    return res.status(409).send({ message: "You already have an active request for this service" });
+  }
+
+  const booking = {
+    serviceId: String(service._id),
+    serviceTitle: service.title,
+    serviceImage: service.image,
+    category: service.category,
+    basePrice: service.basePrice,
+    technicianName: service.technicianName,
+    technicianEmail: service.technicianEmail,
+    customerName: req.user.name,
+    customerEmail: req.user.email,
+    customerPhone: phone,
+    address: addr,
+    preferredDate: new Date(preferredDate),
+    problemDescription: problem,
+    status: "requested",
+    finalAmount: service.basePrice,
+    paymentStatus: "unpaid",
+    statusHistory: [historyEntry("requested")],
+    createdAt: new Date(),
+  };
+  const result = await bookingsCol.insertOne(booking);
+  res.status(201).send(result);
+});
+
+app.get("/api/bookings/my", verifyToken, verifyCustomer, async (req, res) => {
+  const result = await bookingsCol.find({ customerEmail: req.user.email }).sort({ createdAt: -1 }).toArray();
+  res.send(result);
+});
+
+app.get("/api/bookings/technician", verifyToken, verifyTechnician, async (req, res) => {
+  const query = { technicianEmail: req.user.email };
+  if (req.query.status) query.status = String(req.query.status);
+  const result = await bookingsCol.find(query).sort({ createdAt: -1 }).toArray();
+  res.send(result);
+});
+
+app.patch("/api/bookings/:id/cancel", verifyToken, verifyCustomer, async (req, res) => {
+  const _id = toId(req.params.id);
+  if (!_id) return res.status(400).send({ message: "Invalid booking id" });
+  const booking = await bookingsCol.findOne({ _id });
+  if (!booking) return res.status(404).send({ message: "Booking not found" });
+  if (booking.customerEmail !== req.user.email) {
+    return res.status(403).send({ message: "You can only cancel your own bookings" });
+  }
+  if (booking.status !== "requested") {
+    return res.status(400).send({ message: "Only a requested job can be cancelled" });
+  }
+  const result = await bookingsCol.updateOne(
+    { _id },
+    { $set: { status: "cancelled" }, $push: { statusHistory: historyEntry("cancelled") } }
+  );
+  res.send(result);
+});
+
+// Challenge 3: only the owner technician, only the allowed next step
+app.patch("/api/bookings/:id/status", verifyToken, verifyTechnician, async (req, res) => {
+  const _id = toId(req.params.id);
+  if (!_id) return res.status(400).send({ message: "Invalid booking id" });
+  const { status, finalAmount } = req.body || {};
+  const booking = await bookingsCol.findOne({ _id });
+  if (!booking) return res.status(404).send({ message: "Booking not found" });
+  if (booking.technicianEmail !== req.user.email) {
+    return res.status(403).send({ message: "Only the technician of this job can update it" });
+  }
+  const allowed = NEXT_STATUS[booking.status] || [];
+  if (!allowed.includes(status)) {
+    return res.status(400).send({ message: `A ${booking.status} job cannot be changed to ${status}` });
+  }
+  const set = { status };
+  if (status === "completed") {
+    const amount = Number(finalAmount);
+    if (!(amount > 0)) return res.status(400).send({ message: "Final amount must be greater than 0" });
+    set.finalAmount = Math.round(amount * 100) / 100;
+  }
+  const result = await bookingsCol.updateOne({ _id }, { $set: set, $push: { statusHistory: historyEntry(status) } });
+  res.send(result);
+});
 // ---------- ROUTES BELOW (more are added in the next steps) ----------
 
 // ---------- fallbacks ----------
