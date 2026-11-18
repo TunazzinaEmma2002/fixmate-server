@@ -43,7 +43,75 @@ function ensureConnected() {
 }
 
 // ---------- middlewares ----------
-// STRIPE_WEBHOOK_HERE (the raw-body webhook route goes above express.json)
+// ---------- Stripe (test mode) ----------
+const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+
+// one payment per Stripe session, enforced by a unique index
+let paymentIndex = null;
+const ensurePaymentIndex = () => {
+  if (!paymentIndex) {
+    paymentIndex = paymentsCol.createIndex({ stripeSessionId: 1 }, { unique: true }).catch((err) => {
+      paymentIndex = null;
+      throw err;
+    });
+  }
+  return paymentIndex;
+};
+
+// Used by both the success-page verification and the webhook, so a payment is never saved twice
+async function savePayment(session) {
+  if (!session || session.payment_status !== "paid") return null;
+  await ensurePaymentIndex();
+  const existing = await paymentsCol.findOne({ stripeSessionId: session.id });
+  if (existing) return existing;
+
+  const bookingId = toId(session.metadata?.bookingId);
+  const booking = bookingId ? await bookingsCol.findOne({ _id: bookingId }) : null;
+  if (!booking) return null;
+
+  const paidAt = new Date();
+  const payment = {
+    bookingId: String(booking._id),
+    serviceTitle: booking.serviceTitle,
+    customerName: booking.customerName,
+    customerEmail: booking.customerEmail,
+    technicianName: booking.technicianName,
+    technicianEmail: booking.technicianEmail,
+    amount: (session.amount_total || 0) / 100,
+    currency: session.currency || "usd",
+    transactionId: String(session.payment_intent || ""),
+    stripeSessionId: session.id,
+    paymentStatus: "paid",
+    paidAt,
+  };
+  try {
+    await paymentsCol.insertOne(payment);
+  } catch (err) {
+    if (err.code === 11000) return paymentsCol.findOne({ stripeSessionId: session.id });
+    throw err;
+  }
+  await bookingsCol.updateOne({ _id: booking._id }, { $set: { paymentStatus: "paid", paidAt } });
+  return payment;
+}
+
+// Challenge 4: Stripe webhook. It needs the raw body, so it must be above express.json()
+app.post("/api/payments/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    return res.status(400).send(`Webhook error: ${err.message}`);
+  }
+  if (event.type === "checkout.session.completed") {
+    await ensureConnected();
+    await savePayment(event.data.object);
+  }
+  res.send({ received: true });
+});
 app.use(
   cors({
     origin: (origin, cb) => {
