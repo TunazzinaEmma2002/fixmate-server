@@ -596,6 +596,71 @@ app.get("/api/public/stats", async (req, res) => {
   ]);
   res.send({ technicians, services, completedJobs });
 });
+// ---------- payments ----------
+// Only a completed + unpaid booking of the logged-in customer can be paid
+app.post("/api/payments/create-checkout-session", verifyToken, verifyCustomer, async (req, res) => {
+  const _id = toId(req.body?.bookingId);
+  if (!_id) return res.status(400).send({ message: "Invalid booking id" });
+  const booking = await bookingsCol.findOne({ _id });
+  if (!booking) return res.status(404).send({ message: "Booking not found" });
+  if (booking.customerEmail !== req.user.email) {
+    return res.status(403).send({ message: "You can only pay for your own bookings" });
+  }
+  if (booking.status !== "completed") {
+    return res.status(400).send({ message: "You can pay only after the job is completed" });
+  }
+  if (booking.paymentStatus === "paid") {
+    return res.status(400).send({ message: "This booking is already paid" });
+  }
+  // the amount always comes from the database, never from the client
+  const cents = Math.round(Number(booking.finalAmount) * 100);
+  if (!(cents >= 50)) return res.status(400).send({ message: "The minimum payable amount is $0.50" });
+
+  const clientUrl = (process.env.CLIENT_URL || "").split(",")[0].trim();
+  const session = await stripe.checkout.sessions.create({
+    mode: "payment",
+    customer_email: req.user.email,
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: "usd",
+          unit_amount: cents,
+          product_data: { name: booking.serviceTitle, description: `Repair job by ${booking.technicianName}` },
+        },
+      },
+    ],
+    metadata: { bookingId: String(booking._id), customerEmail: req.user.email },
+    success_url: `${clientUrl}/payment/success?session_id={CHECKOUT_SESSION_ID}`,
+    cancel_url: `${clientUrl}/payment/cancel`,
+  });
+  res.send({ url: session.url });
+});
+
+app.get("/api/payments/verify", verifyToken, verifyCustomer, async (req, res) => {
+  const sessionId = String(req.query.session_id || "");
+  if (!sessionId) return res.status(400).send({ message: "Missing session id" });
+  let session;
+  try {
+    session = await stripe.checkout.sessions.retrieve(sessionId);
+  } catch {
+    return res.status(404).send({ message: "Payment session not found" });
+  }
+  if (session.metadata?.customerEmail !== req.user.email) {
+    return res.status(403).send({ message: "This payment does not belong to you" });
+  }
+  if (session.payment_status !== "paid") {
+    return res.status(400).send({ message: "Payment is not completed yet" });
+  }
+  const payment = await savePayment(session);
+  if (!payment) return res.status(404).send({ message: "Booking for this payment was not found" });
+  res.send({ success: true, payment });
+});
+
+app.get("/api/payments/my", verifyToken, verifyCustomer, async (req, res) => {
+  const result = await paymentsCol.find({ customerEmail: req.user.email }).sort({ paidAt: -1 }).toArray();
+  res.send(result);
+});
 // ---------- ROUTES BELOW (more are added in the next steps) ----------
 
 // ---------- fallbacks ----------
