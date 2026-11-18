@@ -374,6 +374,160 @@ app.patch("/api/bookings/:id/status", verifyToken, verifyTechnician, async (req,
   const result = await bookingsCol.updateOne({ _id }, { $set: set, $push: { statusHistory: historyEntry(status) } });
   res.send(result);
 });
+
+// ---------- profile ----------
+app.get("/api/users/profile", verifyToken, async (req, res) => {
+  const user = await usersCol.findOne({ email: req.user.email });
+  res.send({
+    name: user.name,
+    email: user.email,
+    image: user.image || "",
+    role: user.role || "customer",
+    phone: user.phone || "",
+    area: user.area || "",
+    bio: user.bio || "",
+  });
+});
+
+app.patch("/api/users/profile", verifyToken, async (req, res) => {
+  const { name, phone, area, bio, image } = req.body || {};
+  const set = {
+    name: String(name || "").trim(),
+    phone: String(phone || "").trim(),
+    area: String(area || "").trim(),
+    bio: String(bio || "").trim().slice(0, 300),
+    updatedAt: new Date(),
+  };
+  if (set.name.length < 2) return res.status(400).send({ message: "Please enter your name" });
+  if (typeof image === "string" && image.trim()) set.image = image.trim();
+  const result = await usersCol.updateOne({ email: req.user.email }, { $set: set });
+  res.send(result);
+});
+
+// ---------- admin ----------
+app.get("/api/admin/users", verifyToken, verifyAdmin, async (req, res) => {
+  const users = await usersCol.find({}).sort({ createdAt: -1 }).toArray();
+  res.send(
+    users.map((u) => ({
+      _id: u._id,
+      name: u.name,
+      email: u.email,
+      image: u.image || "",
+      role: u.role || "customer",
+      createdAt: u.createdAt,
+    }))
+  );
+});
+
+app.patch("/api/admin/users/:id/role", verifyToken, verifyAdmin, async (req, res) => {
+  const _id = toId(req.params.id);
+  const { role } = req.body || {};
+  if (!_id) return res.status(400).send({ message: "Invalid user id" });
+  if (!["customer", "technician", "admin"].includes(role)) {
+    return res.status(400).send({ message: "Invalid role" });
+  }
+  const user = await usersCol.findOne({ _id });
+  if (!user) return res.status(404).send({ message: "User not found" });
+  if (user.email === req.user.email) {
+    return res.status(400).send({ message: "You cannot change your own role" });
+  }
+  const result = await usersCol.updateOne({ _id }, { $set: { role } });
+  res.send(result);
+});
+
+app.get("/api/admin/services", verifyToken, verifyAdmin, async (req, res) => {
+  const query = {};
+  if (req.query.approvalStatus) query.approvalStatus = String(req.query.approvalStatus);
+  const result = await servicesCol.find(query).sort({ createdAt: -1 }).toArray();
+  res.send(result);
+});
+
+app.patch("/api/admin/services/:id/approval", verifyToken, verifyAdmin, async (req, res) => {
+  const _id = toId(req.params.id);
+  const { approvalStatus } = req.body || {};
+  if (!_id) return res.status(400).send({ message: "Invalid service id" });
+  if (!["approved", "rejected"].includes(approvalStatus)) {
+    return res.status(400).send({ message: "Approval status must be approved or rejected" });
+  }
+  const service = await servicesCol.findOne({ _id });
+  if (!service) return res.status(404).send({ message: "Service not found" });
+  const result = await servicesCol.updateOne({ _id }, { $set: { approvalStatus } });
+  res.send(result);
+});
+
+app.get("/api/admin/bookings", verifyToken, verifyAdmin, async (req, res) => {
+  const query = {};
+  if (req.query.status) query.status = String(req.query.status);
+  const result = await bookingsCol.find(query).sort({ createdAt: -1 }).toArray();
+  res.send(result);
+});
+
+app.get("/api/admin/payments", verifyToken, verifyAdmin, async (req, res) => {
+  const payments = await paymentsCol.find({}).sort({ paidAt: -1 }).toArray();
+  res.send({ totalRevenue: sumOf(payments, "amount"), payments });
+});
+
+// ---------- stats for the dashboards and the home page ----------
+app.get("/api/dashboard/stats", verifyToken, async (req, res) => {
+  const { role, email } = req.user;
+  if (role === "customer") {
+    const bookings = await bookingsCol.find({ customerEmail: email }).toArray();
+    const payments = await paymentsCol.find({ customerEmail: email }).toArray();
+    return res.send({
+      totalRequests: bookings.length,
+      activeJobs: bookings.filter((b) => ACTIVE.includes(b.status)).length,
+      completedJobs: bookings.filter((b) => b.status === "completed").length,
+      totalSpent: sumOf(payments, "amount"),
+      byStatus: countBy(bookings, "status"),
+    });
+  }
+  if (role === "technician") {
+    const services = await servicesCol.find({ technicianEmail: email }).toArray();
+    const bookings = await bookingsCol.find({ technicianEmail: email }).toArray();
+    const payments = await paymentsCol.find({ technicianEmail: email }).toArray();
+    return res.send({
+      totalServices: services.length,
+      approvedServices: services.filter((s) => s.approvalStatus === "approved").length,
+      pendingRequests: bookings.filter((b) => b.status === "requested").length,
+      totalEarned: sumOf(payments, "amount"),
+      byStatus: countBy(bookings, "status"),
+    });
+  }
+  // admin
+  const [users, technicians, pendingServices] = await Promise.all([
+    usersCol.countDocuments({}),
+    usersCol.countDocuments({ role: "technician" }),
+    servicesCol.countDocuments({ approvalStatus: "pending" }),
+  ]);
+  const bookings = await bookingsCol.find({}).toArray();
+  const payments = await paymentsCol.find({}).toArray();
+  const revenueByDay = {};
+  for (let i = 6; i >= 0; i--) {
+    revenueByDay[new Date(Date.now() - i * 86400000).toISOString().slice(0, 10)] = 0;
+  }
+  payments.forEach((p) => {
+    const day = new Date(p.paidAt).toISOString().slice(0, 10);
+    if (day in revenueByDay) revenueByDay[day] += Number(p.amount) || 0;
+  });
+  res.send({
+    totalUsers: users,
+    totalTechnicians: technicians,
+    pendingServices,
+    totalBookings: bookings.length,
+    totalRevenue: sumOf(payments, "amount"),
+    byStatus: countBy(bookings, "status"),
+    revenueByDay,
+  });
+});
+
+app.get("/api/public/stats", async (req, res) => {
+  const [technicians, services, completedJobs] = await Promise.all([
+    usersCol.countDocuments({ role: "technician" }),
+    servicesCol.countDocuments(publicFilter),
+    bookingsCol.countDocuments({ status: "completed" }),
+  ]);
+  res.send({ technicians, services, completedJobs });
+});
 // ---------- ROUTES BELOW (more are added in the next steps) ----------
 
 // ---------- fallbacks ----------
