@@ -127,6 +127,141 @@ app.post("/logout", (req, res) => {
 
 app.get("/api/me", verifyToken, (req, res) => res.send(req.user));
 
+// ---------- constants + validation ----------
+const CATEGORIES = ["Smartphone", "Laptop & PC", "AC", "Refrigerator", "TV", "Washing Machine", "Electrical"];
+const MODES = ["Home Visit", "Shop Drop-off"];
+const ACTIVE = ["requested", "accepted", "in-progress"];
+// Challenge 3: the only moves the server allows
+const NEXT_STATUS = {
+  requested: ["accepted", "rejected"],
+  accepted: ["in-progress"],
+  "in-progress": ["completed"],
+};
+const publicFilter = { approvalStatus: "approved", isAvailable: true };
+const historyEntry = (status) => ({ status, changedAt: new Date() });
+
+function pickService(body = {}) {
+  return {
+    title: String(body.title || "").trim(),
+    category: String(body.category || "").trim(),
+    description: String(body.description || "").trim(),
+    image: String(body.image || "").trim(),
+    basePrice: Number(body.basePrice),
+    estimatedDuration: String(body.estimatedDuration || "").trim(),
+    serviceMode: String(body.serviceMode || "").trim(),
+    serviceArea: String(body.serviceArea || "").trim(),
+  };
+}
+
+function serviceError(s) {
+  if (!s.title || !s.description || !s.image || !s.estimatedDuration || !s.serviceArea) {
+    return "Title, description, image, duration and service area are required";
+  }
+  if (!CATEGORIES.includes(s.category)) return "Please choose a valid category";
+  if (!MODES.includes(s.serviceMode)) return "Please choose a valid service mode";
+  if (!(s.basePrice > 0)) return "Base price must be greater than 0";
+  return null;
+}
+
+const sumOf = (list, key) => Math.round(list.reduce((sum, item) => sum + (Number(item[key]) || 0), 0) * 100) / 100;
+const countBy = (list, key) => list.reduce((acc, item) => ({ ...acc, [item[key]]: (acc[item[key]] || 0) + 1 }), {});
+
+// ---------- services ----------
+// Challenge 1: search, filter and sort all happen in MongoDB
+app.get("/api/services", async (req, res) => {
+  const { search, category, serviceMode, sort, limit } = req.query;
+  const query = { ...publicFilter };
+  if (category) query.category = String(category);
+  if (serviceMode) query.serviceMode = String(serviceMode);
+  if (search) {
+    const rx = { $regex: escapeRegex(String(search).trim()), $options: "i" };
+    query.$or = [{ title: rx }, { category: rx }];
+  }
+  const sorts = {
+    "price-asc": { basePrice: 1 },
+    "price-desc": { basePrice: -1 },
+    newest: { createdAt: -1 },
+  };
+  let cursor = servicesCol.find(query).sort(sorts[sort] || sorts.newest);
+  const max = Number(limit);
+  if (max > 0) cursor = cursor.limit(Math.min(max, 50));
+  res.send(await cursor.toArray());
+});
+
+app.get("/api/services/mine", verifyToken, verifyTechnician, async (req, res) => {
+  const result = await servicesCol.find({ technicianEmail: req.user.email }).sort({ createdAt: -1 }).toArray();
+  res.send(result);
+});
+
+app.get("/api/services/:id", async (req, res) => {
+  const _id = toId(req.params.id);
+  if (!_id) return res.status(404).send({ message: "Service not found" });
+  const service = await servicesCol.findOne({ _id, ...publicFilter });
+  if (!service) return res.status(404).send({ message: "Service not found" });
+  const tech = await usersCol.findOne({ email: service.technicianEmail });
+  res.send({
+    ...service,
+    technician: {
+      name: tech?.name || service.technicianName,
+      image: tech?.image || "",
+      area: tech?.area || "",
+      bio: tech?.bio || "",
+    },
+  });
+});
+
+app.post("/api/services", verifyToken, verifyTechnician, async (req, res) => {
+  const data = pickService(req.body);
+  const error = serviceError(data);
+  if (error) return res.status(400).send({ message: error });
+  const service = {
+    ...data,
+    technicianName: req.user.name, // always from the logged-in user, never from the form
+    technicianEmail: req.user.email,
+    approvalStatus: "pending",
+    isAvailable: true,
+    createdAt: new Date(),
+  };
+  const result = await servicesCol.insertOne(service);
+  res.status(201).send(result);
+});
+
+app.patch("/api/services/:id", verifyToken, verifyTechnician, async (req, res) => {
+  const _id = toId(req.params.id);
+  if (!_id) return res.status(400).send({ message: "Invalid service id" });
+  const service = await servicesCol.findOne({ _id });
+  if (!service) return res.status(404).send({ message: "Service not found" });
+  if (service.technicianEmail !== req.user.email) {
+    return res.status(403).send({ message: "You can only change your own services" });
+  }
+  const body = req.body || {};
+  // only the availability switch: do not send it back to admin approval
+  if (Object.keys(body).length === 1 && typeof body.isAvailable === "boolean") {
+    const result = await servicesCol.updateOne({ _id }, { $set: { isAvailable: body.isAvailable } });
+    return res.send(result);
+  }
+  const data = pickService(body);
+  const error = serviceError(data);
+  if (error) return res.status(400).send({ message: error });
+  // editing a service sends it back to the admin for approval
+  const result = await servicesCol.updateOne(
+    { _id },
+    { $set: { ...data, approvalStatus: "pending", updatedAt: new Date() } }
+  );
+  res.send(result);
+});
+
+app.delete("/api/services/:id", verifyToken, verifyTechnician, async (req, res) => {
+  const _id = toId(req.params.id);
+  if (!_id) return res.status(400).send({ message: "Invalid service id" });
+  const service = await servicesCol.findOne({ _id });
+  if (!service) return res.status(404).send({ message: "Service not found" });
+  if (service.technicianEmail !== req.user.email) {
+    return res.status(403).send({ message: "You can only delete your own services" });
+  }
+  const result = await servicesCol.deleteOne({ _id });
+  res.send(result);
+});
 // ---------- ROUTES BELOW (more are added in the next steps) ----------
 
 // ---------- fallbacks ----------
