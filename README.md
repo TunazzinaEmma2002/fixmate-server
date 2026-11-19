@@ -18,7 +18,6 @@ Built with Express.js, MongoDB, JWT and Stripe.
 
 Stripe test card: `4242 4242 4242 4242`, any future date, any CVC.
 
-> **Google sign in:** the Google button works with BetterAuth, but the Google app is in *Testing* mode, so only Gmail accounts added as test users can use it (a Google user becomes a `customer`). Reviewers please use the email and password accounts above.
 
 ## Key features
 
